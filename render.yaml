@@ -1,0 +1,33 @@
+# این فایل به Render اجازه می‌ده که با روش "Blueprint" کل پروژه (وب‌سرویس + دیتابیس)
+# رو خودکار و با یک کلیک بسازه، بدون نیاز به تنظیم دستی هر بخش.
+#
+# نحوه استفاده:
+#   1. کد رو به گیت‌هاب push کن
+#   2. در Render: New + -> Blueprint -> ریپازیتوری رو انتخاب کن
+#   3. Render خودش این فایل رو می‌خونه و دیتابیس + وب‌سرویس رو می‌سازه
+#   4. فقط مقدار JWT_SECRET رو وقتی خواست وارد کن (یا بذار خودکار تولید کنه)
+
+databases:
+  - name: salam-hills-db
+    plan: free
+    databaseName: salam_hills
+    user: salam_hills_user
+
+services:
+  - type: web
+    name: salam-hills-game
+    runtime: node
+    plan: free
+    branch: main
+    buildCommand: npm install && npx drizzle-kit push --force && npm run build
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: salam-hills-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: NODE_ENV
+        value: production
