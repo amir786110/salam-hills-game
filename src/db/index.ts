@@ -11,15 +11,29 @@ const globalForDb = globalThis as typeof globalThis & {
   __arenaNextJsPostgresqlPool?: Pool;
 };
 
-// هاست‌های مدیریت‌شده مثل Render/Neon/Supabase معمولاً برای اتصال از بیرون
-// نیاز به SSL دارن. برای دیتابیس محلی (127.0.0.1/localhost) نیازی به SSL نیست.
+// تشخیص هوشمند نیاز به SSL:
+// - دیتابیس محلی (localhost/127.0.0.1) هرگز به SSL نیاز نداره
+// - بعضی هاست‌های ابری (مثل Render/Neon/Supabase) برای اتصال از بیرون SSL لازم دارن
+// - بعضی دیگه (مثل شبکه داخلی لیارا) اصلاً SSL رو پشتیبانی نمی‌کنن و فعال کردنش
+//   باعث قطع کامل اتصال می‌شه
+// راه‌حل: با متغیر DB_SSL می‌شه صریحاً کنترلش کرد؛ اگر ست نشده بود، فقط وقتی
+// خود connection string با ?sslmode=require مشخص کرده باشه فعال می‌شه.
 const isLocalDb = /localhost|127\.0\.0\.1/.test(databaseUrl);
+const explicitSslEnv = process.env.DB_SSL;
+const urlRequestsSsl = /sslmode=require/i.test(databaseUrl);
+
+function resolveSslOption(): boolean | { rejectUnauthorized: boolean } {
+  if (isLocalDb) return false;
+  if (explicitSslEnv === "true") return { rejectUnauthorized: false };
+  if (explicitSslEnv === "false") return false;
+  return urlRequestsSsl ? { rejectUnauthorized: false } : false;
+}
 
 export const pool =
   globalForDb.__arenaNextJsPostgresqlPool ??
   new Pool({
     connectionString: databaseUrl,
-    ssl: isLocalDb ? undefined : { rejectUnauthorized: false },
+    ssl: resolveSslOption(),
   });
 
 if (process.env.NODE_ENV !== "production") {
