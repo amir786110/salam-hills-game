@@ -12,6 +12,11 @@ import {
   haversineMeters, nearestLandmark, type Polygon,
 } from "./geo";
 
+// نوع کمکی برای تراکنش‌ها (هم db و هم tx می‌تونن اینجا پاس داده بشن)
+// به‌جای وابستگی به نوع schema (که با نحوه‌ی ساخت فعلی db سازگار نبود)،
+// نوع پارامتر tx را مستقیماً از خود db.transaction استخراج می‌کنیم
+type DbOrTx = typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0];
+
 // ============ اعتبارسنجی ورودی (رفع باگ NaN/منفی که می‌تونست منابع بازی رو خراب کنه) ============
 export function assertPositiveInt(n: unknown, label: string): number {
   if (typeof n !== "number" || !Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
@@ -109,8 +114,8 @@ export function inventoryWorth(inv: UnitInventory): number {
   return w;
 }
 
-export async function areAllied(a: number, b: number): Promise<boolean> {
-  const rows = await db.select().from(alliances).where(
+export async function areAllied(a: number, b: number, executor: DbOrTx = db): Promise<boolean> {
+  const rows = await executor.select().from(alliances).where(
     or(and(eq(alliances.tribeAId, a), eq(alliances.tribeBId, b)),
        and(eq(alliances.tribeAId, b), eq(alliances.tribeBId, a)))
   );
@@ -157,90 +162,97 @@ export type BuyPayload =
   | { kind: "factory_repair"; factoryId: string; percent: number };
 
 export async function buy(tribeId: number, payload: BuyPayload) {
-  const [t] = await db.select().from(tribes).where(eq(tribes.id, tribeId));
-  if (!t) throw new Error("قبیله یافت نشد");
-  if (!t.isAlive) throw new Error("قبیله از بین رفته");
+  // رفع باگ race condition: قبلاً خواندن قبیله و آپدیتش دو عملیات جدا بودن.
+  // اگر کاربر (یا AI) دو درخواست خرید را تقریباً همزمان می‌فرستاد، هر دو
+  // می‌توانستند بر اساس یک «coins» قدیمی مشترک عبور کنند و در نتیجه هیلزکوین
+  // بیشتر از موجودی واقعی خرج شود. حالا با تراکنش + قفل ردیف (FOR UPDATE)
+  // این عملیات کاملاً اتمیک است.
+  return db.transaction(async (tx) => {
+    const [t] = await tx.select().from(tribes).where(eq(tribes.id, tribeId)).for("update");
+    if (!t) throw new Error("قبیله یافت نشد");
+    if (!t.isAlive) throw new Error("قبیله از بین رفته");
 
-  if (payload.kind === "soldier") {
-    const q = assertPositiveInt(payload.quantity, "تعداد سرباز");
-    if (t.soldiers + q > MAX_SOLDIERS) throw new Error(`ظرفیت ${MAX_SOLDIERS} نفره`);
-    const cost = q * SOLDIER_PRICE;
-    if (t.coins < cost) throw new Error("هیلزکوین کافی نیست");
-    await db.update(tribes).set({
-      coins: t.coins - cost, soldiers: t.soldiers + q, updatedAt: new Date(),
-    }).where(eq(tribes.id, tribeId));
-    return { success: true };
-  }
+    if (payload.kind === "soldier") {
+      const q = assertPositiveInt(payload.quantity, "تعداد سرباز");
+      if (t.soldiers + q > MAX_SOLDIERS) throw new Error(`ظرفیت ${MAX_SOLDIERS} نفره`);
+      const cost = q * SOLDIER_PRICE;
+      if (t.coins < cost) throw new Error("هیلزکوین کافی نیست");
+      await tx.update(tribes).set({
+        coins: t.coins - cost, soldiers: t.soldiers + q, updatedAt: new Date(),
+      }).where(eq(tribes.id, tribeId));
+      return { success: true };
+    }
 
-  if (payload.kind === "unit") {
-    if (typeof payload.unitId !== "string") throw new Error("تسلیحات نامعتبر");
-    const u = UNIT_BY_ID[payload.unitId];
-    if (!u) throw new Error("تسلیحات یافت نشد");
-    const q = assertPositiveInt(payload.quantity, "تعداد");
-    const cost = u.price * q;
-    if (t.coins < cost) throw new Error("هیلزکوین کافی نیست");
-    const field = u.kind === "jet" ? "jetsInventory" : u.kind === "missile" ? "missilesInventory" : "defensesInventory";
-    const currentInv = { ...((t[field as keyof Tribe] as UnitInventory) ?? {}) };
-    currentInv[u.id] = (currentInv[u.id] ?? 0) + q;
-    await db.update(tribes).set({
-      coins: t.coins - cost,
-      [field]: currentInv,
-      updatedAt: new Date(),
-    }).where(eq(tribes.id, tribeId));
-    return { success: true };
-  }
+    if (payload.kind === "unit") {
+      if (typeof payload.unitId !== "string") throw new Error("تسلیحات نامعتبر");
+      const u = UNIT_BY_ID[payload.unitId];
+      if (!u) throw new Error("تسلیحات یافت نشد");
+      const q = assertPositiveInt(payload.quantity, "تعداد");
+      const cost = u.price * q;
+      if (t.coins < cost) throw new Error("هیلزکوین کافی نیست");
+      const field = u.kind === "jet" ? "jetsInventory" : u.kind === "missile" ? "missilesInventory" : "defensesInventory";
+      const currentInv = { ...((t[field as keyof Tribe] as UnitInventory) ?? {}) };
+      currentInv[u.id] = (currentInv[u.id] ?? 0) + q;
+      await tx.update(tribes).set({
+        coins: t.coins - cost,
+        [field]: currentInv,
+        updatedAt: new Date(),
+      }).where(eq(tribes.id, tribeId));
+      return { success: true };
+    }
 
-  if (payload.kind === "factory_build") {
-    if (typeof payload.factoryId !== "string") throw new Error("کارخانه نامعتبر");
-    const def = FACTORY_BY_ID[payload.factoryId];
-    if (!def) throw new Error("کارخانه یافت نشد");
-    if (t.coins < def.price) throw new Error("هیلزکوین کافی نیست");
-    const factories = [...((t.factories as FactoryInstance[]) ?? [])];
-    const existingCount = factories.filter((f) => f.id === def.id).length;
-    if (existingCount >= 4) throw new Error("حداکثر تعداد این نوع کارخانه رو داری");
-    factories.push({ id: def.id, level: 1, health: 100 });
-    await db.update(tribes).set({
-      coins: t.coins - def.price, factories, updatedAt: new Date(),
-    }).where(eq(tribes.id, tribeId));
-    return { success: true };
-  }
+    if (payload.kind === "factory_build") {
+      if (typeof payload.factoryId !== "string") throw new Error("کارخانه نامعتبر");
+      const def = FACTORY_BY_ID[payload.factoryId];
+      if (!def) throw new Error("کارخانه یافت نشد");
+      if (t.coins < def.price) throw new Error("هیلزکوین کافی نیست");
+      const factories = [...((t.factories as FactoryInstance[]) ?? [])];
+      const existingCount = factories.filter((f) => f.id === def.id).length;
+      if (existingCount >= 4) throw new Error("حداکثر تعداد این نوع کارخانه رو داری");
+      factories.push({ id: def.id, level: 1, health: 100 });
+      await tx.update(tribes).set({
+        coins: t.coins - def.price, factories, updatedAt: new Date(),
+      }).where(eq(tribes.id, tribeId));
+      return { success: true };
+    }
 
-  if (payload.kind === "factory_upgrade") {
-    if (typeof payload.factoryId !== "string") throw new Error("کارخانه نامعتبر");
-    const factories = [...((t.factories as FactoryInstance[]) ?? [])];
-    const idx = factories.findIndex((f) => f.id === payload.factoryId);
-    if (idx < 0) throw new Error("این کارخونه رو نداری");
-    const def = FACTORY_BY_ID[factories[idx].id];
-    if (!def) throw new Error("کارخانه یافت نشد");
-    if (factories[idx].level >= def.maxLevel) throw new Error("در حداکثر لول است");
-    const cost = upgradeCost(def.price, factories[idx].level);
-    if (t.coins < cost) throw new Error("هیلزکوین کافی نیست");
-    factories[idx] = { ...factories[idx], level: factories[idx].level + 1 };
-    await db.update(tribes).set({
-      coins: t.coins - cost, factories, updatedAt: new Date(),
-    }).where(eq(tribes.id, tribeId));
-    return { success: true };
-  }
+    if (payload.kind === "factory_upgrade") {
+      if (typeof payload.factoryId !== "string") throw new Error("کارخانه نامعتبر");
+      const factories = [...((t.factories as FactoryInstance[]) ?? [])];
+      const idx = factories.findIndex((f) => f.id === payload.factoryId);
+      if (idx < 0) throw new Error("این کارخونه رو نداری");
+      const def = FACTORY_BY_ID[factories[idx].id];
+      if (!def) throw new Error("کارخانه یافت نشد");
+      if (factories[idx].level >= def.maxLevel) throw new Error("در حداکثر لول است");
+      const cost = upgradeCost(def.price, factories[idx].level);
+      if (t.coins < cost) throw new Error("هیلزکوین کافی نیست");
+      factories[idx] = { ...factories[idx], level: factories[idx].level + 1 };
+      await tx.update(tribes).set({
+        coins: t.coins - cost, factories, updatedAt: new Date(),
+      }).where(eq(tribes.id, tribeId));
+      return { success: true };
+    }
 
-  if (payload.kind === "factory_repair") {
-    if (typeof payload.factoryId !== "string") throw new Error("کارخانه نامعتبر");
-    const factories = [...((t.factories as FactoryInstance[]) ?? [])];
-    const idx = factories.findIndex((f) => f.id === payload.factoryId);
-    if (idx < 0) throw new Error("این کارخونه رو نداری");
-    const requestedPercent = assertPositiveInt(payload.percent, "درصد بازسازی");
-    const missing = 100 - factories[idx].health;
-    const percent = Math.min(requestedPercent, missing);
-    if (percent <= 0) throw new Error("سلامت کامله");
-    const cost = percent * REPAIR_COST_PER_PERCENT;
-    if (t.coins < cost) throw new Error("هیلزکوین کافی نیست");
-    factories[idx] = { ...factories[idx], health: factories[idx].health + percent };
-    await db.update(tribes).set({
-      coins: t.coins - cost, factories, updatedAt: new Date(),
-    }).where(eq(tribes.id, tribeId));
-    return { success: true };
-  }
+    if (payload.kind === "factory_repair") {
+      if (typeof payload.factoryId !== "string") throw new Error("کارخانه نامعتبر");
+      const factories = [...((t.factories as FactoryInstance[]) ?? [])];
+      const idx = factories.findIndex((f) => f.id === payload.factoryId);
+      if (idx < 0) throw new Error("این کارخونه رو نداری");
+      const requestedPercent = assertPositiveInt(payload.percent, "درصد بازسازی");
+      const missing = 100 - factories[idx].health;
+      const percent = Math.min(requestedPercent, missing);
+      if (percent <= 0) throw new Error("سلامت کامله");
+      const cost = percent * REPAIR_COST_PER_PERCENT;
+      if (t.coins < cost) throw new Error("هیلزکوین کافی نیست");
+      factories[idx] = { ...factories[idx], health: factories[idx].health + percent };
+      await tx.update(tribes).set({
+        coins: t.coins - cost, factories, updatedAt: new Date(),
+      }).where(eq(tribes.id, tribeId));
+      return { success: true };
+    }
 
-  throw new Error("نوع نامعتبر");
+    throw new Error("نوع نامعتبر");
+  });
 }
 
 // ============ حمله ============
@@ -281,329 +293,319 @@ export async function performAttack(params: AttackParams): Promise<AttackResult>
   if (uniqueAttackerIds.length !== attackerIds.length) throw new Error("شناسه قبیله تکراری در لیست مهاجمان");
   if (uniqueAttackerIds.includes(defenderId)) throw new Error("قبیله نمی‌تواند به خودش حمله کند");
 
-  const attackers: Tribe[] = [];
-  for (const id of uniqueAttackerIds) {
-    const [t] = await db.select().from(tribes).where(eq(tribes.id, id));
-    if (!t) throw new Error("قبیله حمله‌کننده یافت نشد");
-    if (!t.isAlive) throw new Error(`قبیله ${t.name} از بین رفته است`);
-    attackers.push(t);
-  }
-  const [defender] = await db.select().from(tribes).where(eq(tribes.id, defenderId));
-  if (!defender) throw new Error("قبیله مدافع یافت نشد");
-  if (!defender.isAlive) throw new Error("این قبیله از بین رفته");
-
-  const serverId = attackers[0].serverId;
-  if (defender.serverId !== serverId || attackers.some((a) => a.serverId !== serverId)) {
-    throw new Error("همه قبایل باید در یک سرور باشند");
-  }
-  for (const a of attackers) {
-    if (await areAllied(a.id, defenderId)) throw new Error(`${a.name} با ${defender.name} متحد است`);
-  }
-  if (attackers.length > 1) {
-    for (let i = 0; i < attackers.length; i++)
-      for (let j = i + 1; j < attackers.length; j++)
-        if (!(await areAllied(attackers[i].id, attackers[j].id)))
-          throw new Error(`${attackers[i].name} و ${attackers[j].name} متحد نیستند`);
-  }
-
-  // جمع انبار مهاجم‌ها
-  const totalMissilesAvail = attackers.reduce((s, t) => s + invCount(t.missilesInventory as UnitInventory), 0);
-  const totalJetsAvail = attackers.reduce((s, t) => s + invCount(t.jetsInventory as UnitInventory), 0);
-  const totalSoldiersAvail = attackers.reduce((s, t) => s + t.soldiers, 0);
-  if (useSoldiers > totalSoldiersAvail) throw new Error("سرباز کافی نیست");
-  if (useMissileTotal > totalMissilesAvail) throw new Error("موشک کافی نیست");
-  if (useJetTotal > totalJetsAvail) throw new Error("جنگنده کافی نیست");
-  if (useSoldiers + useMissileTotal + useJetTotal === 0) throw new Error("حداقل یک واحد نظامی");
-
-  // انتخاب کدام واحدها استفاده شوند (از قوی‌ترین)
-  // برای سادگی: از هر قبیله به نسبت مساوی از انبارش
-  const perAttackerMissilePick: UnitPick[] = [];
-  const perAttackerJetPick: UnitPick[] = [];
-  const perAttackerSoldier: number[] = [];
-
-  // توزیع تعداد کل بین مهاجم‌ها به نسبت انبارشان
-  const distribute = (total: number, avail: number[]): number[] => {
-    const sum = avail.reduce((s, v) => s + v, 0);
-    if (sum === 0) return avail.map(() => 0);
-    const out = avail.map((v) => Math.floor((v / sum) * total));
-    let rem = total - out.reduce((s, v) => s + v, 0);
-    for (let i = 0; i < out.length && rem > 0; i++) {
-      if (avail[i] > out[i]) { out[i]++; rem--; }
+  // رفع باگ بحرانی: کل عملیات حمله (که شامل چندین select/update/insert پی‌درپی
+  // روی چند جدول است) قبلاً در یک تراکنش نبود. اگر وسط عملیات خطایی رخ می‌داد
+  // (قطعی شبکه، کرش سرور، محدودیت دیتابیس)، ممکن بود مثلاً خاک مدافع کم بشه
+  // ولی منابع مهاجم کسر نشه، یا برعکس — یعنی بازی به یک حالت ناسازگار می‌رفت.
+  // با db.transaction، همه‌ی این نوشتن‌ها یا با هم انجام می‌شن یا هیچ‌کدوم.
+  // همچنین با .for("update") روی قبایل درگیر، قفل ردیف می‌گیریم تا دو حمله‌ی
+  // همزمان به یک قبیله (یا با منابع یک قبیله) با داده‌ی بی‌اعتبار همدیگر را خراب نکنند.
+  return db.transaction(async (tx) => {
+    const attackers: Tribe[] = [];
+    for (const id of uniqueAttackerIds) {
+      const [t] = await tx.select().from(tribes).where(eq(tribes.id, id)).for("update");
+      if (!t) throw new Error("قبیله حمله‌کننده یافت نشد");
+      if (!t.isAlive) throw new Error(`قبیله ${t.name} از بین رفته است`);
+      attackers.push(t);
     }
-    return out;
-  };
+    const [defender] = await tx.select().from(tribes).where(eq(tribes.id, defenderId)).for("update");
+    if (!defender) throw new Error("قبیله مدافع یافت نشد");
+    if (!defender.isAlive) throw new Error("این قبیله از بین رفته");
 
-  const missileAvail = attackers.map((a) => invCount(a.missilesInventory as UnitInventory));
-  const jetAvail = attackers.map((a) => invCount(a.jetsInventory as UnitInventory));
-  const solAvail = attackers.map((a) => a.soldiers);
-  const missileForEach = distribute(useMissileTotal, missileAvail);
-  const jetForEach = distribute(useJetTotal, jetAvail);
-  const solForEach = distribute(useSoldiers, solAvail);
-
-  for (let i = 0; i < attackers.length; i++) {
-    perAttackerMissilePick.push(pickTopN(attackers[i].missilesInventory as UnitInventory, MISSILES, missileForEach[i]));
-    perAttackerJetPick.push(pickTopN(attackers[i].jetsInventory as UnitInventory, JETS, jetForEach[i]));
-    perAttackerSoldier.push(solForEach[i]);
-  }
-
-  // ره‌گیری پدافند مدافع: موشک‌ها ممکنه ره‌گیری بشن
-  const defenseInv = (defender.defensesInventory ?? {}) as UnitInventory;
-  let interceptedMissiles = 0;
-  const combinedMissilePick: UnitPick = {};
-  for (const pick of perAttackerMissilePick) {
-    for (const [id, c] of Object.entries(pick)) combinedMissilePick[id] = (combinedMissilePick[id] ?? 0) + c;
-  }
-  // رفع باگ: مجموع اصلی هر مدل را قبل از هر mutation ای ذخیره می‌کنیم
-  // (نسخه قبلی این مقدار را حین حلقه دوباره محاسبه می‌کرد که باعث آلوده شدن
-  // نسبت‌های توزیع بین چند مهاجم همزمان می‌شد)
-  const originalTotalPerMissileId: UnitPick = { ...combinedMissilePick };
-
-  const combinedInterceptProb = (() => {
-    let survive = 1;
-    for (const [id, c] of Object.entries(defenseInv)) {
-      const u = UNIT_BY_ID[id];
-      if (!u) continue;
-      survive *= Math.pow(1 - u.interceptChance, c || 0);
+    const serverId = attackers[0].serverId;
+    if (defender.serverId !== serverId || attackers.some((a) => a.serverId !== serverId)) {
+      throw new Error("همه قبایل باید در یک سرور باشند");
     }
-    return 1 - survive; // احتمال ره‌گیری هر موشک
-  })();
-  const survivorsPerMissileId: UnitPick = {};
-  for (const [id, c] of Object.entries(combinedMissilePick)) {
-    let survivors = 0;
-    for (let i = 0; i < c; i++) {
-      if (Math.random() > combinedInterceptProb) survivors++;
-      else interceptedMissiles++;
+    for (const a of attackers) {
+      if (await areAllied(a.id, defenderId, tx)) throw new Error(`${a.name} با ${defender.name} متحد است`);
     }
-    survivorsPerMissileId[id] = survivors;
-  }
-  // توزیع متناسب survivor ها بین مهاجم‌ها — با استفاده از totals اصلی (قبل از mutation)
-  for (const pick of perAttackerMissilePick) {
-    for (const id of Object.keys(pick)) {
-      const originalTotal = originalTotalPerMissileId[id] ?? 0;
-      if (originalTotal === 0) continue;
-      const survivorsTotal = survivorsPerMissileId[id] ?? 0;
-      pick[id] = Math.floor(((pick[id] ?? 0) / originalTotal) * survivorsTotal);
+    if (attackers.length > 1) {
+      for (let i = 0; i < attackers.length; i++)
+        for (let j = i + 1; j < attackers.length; j++)
+          if (!(await areAllied(attackers[i].id, attackers[j].id, tx)))
+            throw new Error(`${attackers[i].name} و ${attackers[j].name} متحد نیستند`);
     }
-  }
 
-  // محاسبه قدرت واقعی حمله (پس از ره‌گیری)
-  let attackPower = useSoldiers * SOLDIER_ATTACK;
-  for (const pick of perAttackerMissilePick) attackPower += powerOfPick(pick, "attack");
-  for (const pick of perAttackerJetPick) attackPower += powerOfPick(pick, "attack");
+    // جمع انبار مهاجم‌ها
+    const totalMissilesAvail = attackers.reduce((s, t) => s + invCount(t.missilesInventory as UnitInventory), 0);
+    const totalJetsAvail = attackers.reduce((s, t) => s + invCount(t.jetsInventory as UnitInventory), 0);
+    const totalSoldiersAvail = attackers.reduce((s, t) => s + t.soldiers, 0);
+    if (useSoldiers > totalSoldiersAvail) throw new Error("سرباز کافی نیست");
+    if (useMissileTotal > totalMissilesAvail) throw new Error("موشک کافی نیست");
+    if (useJetTotal > totalJetsAvail) throw new Error("جنگنده کافی نیست");
+    if (useSoldiers + useMissileTotal + useJetTotal === 0) throw new Error("حداقل یک واحد نظامی");
 
-  const defensePower = calcDefensePower(defender);
-  const ratio = attackPower / Math.max(1, defensePower);
+    // انتخاب کدام واحدها استفاده شوند (از قوی‌ترین)
+    const perAttackerMissilePick: UnitPick[] = [];
+    const perAttackerJetPick: UnitPick[] = [];
+    const perAttackerSoldier: number[] = [];
 
-  let result: "win" | "lose" | "draw";
-  let metersTaken = 0;
-  let attackerLossRate: number;
-  let defenderLossRate: number;
+    const distribute = (total: number, avail: number[]): number[] => {
+      const sum = avail.reduce((s, v) => s + v, 0);
+      if (sum === 0) return avail.map(() => 0);
+      const out = avail.map((v) => Math.floor((v / sum) * total));
+      let rem = total - out.reduce((s, v) => s + v, 0);
+      for (let i = 0; i < out.length && rem > 0; i++) {
+        if (avail[i] > out[i]) { out[i]++; rem--; }
+      }
+      return out;
+    };
 
-  const attackerLead = polygonCentroid(attackers[0].territoryPolygon as Polygon);
-  const defenderCenter = polygonCentroid(defender.territoryPolygon as Polygon);
-  const distanceBetween = haversineMeters(attackerLead, defenderCenter);
-  const maxAdvance = Math.max(150, distanceBetween * 0.4);
+    const missileAvail = attackers.map((a) => invCount(a.missilesInventory as UnitInventory));
+    const jetAvail = attackers.map((a) => invCount(a.jetsInventory as UnitInventory));
+    const solAvail = attackers.map((a) => a.soldiers);
+    const missileForEach = distribute(useMissileTotal, missileAvail);
+    const jetForEach = distribute(useJetTotal, jetAvail);
+    const solForEach = distribute(useSoldiers, solAvail);
 
-  if (ratio >= 1.15) {
-    result = "win";
-    metersTaken = Math.min(maxAdvance, Math.floor(120 + ratio * 130));
-    attackerLossRate = 0.15 / Math.min(3, ratio);
-    defenderLossRate = 0.5 + Math.min(0.35, ratio * 0.12);
-  } else if (ratio <= 0.85) {
-    result = "lose";
-    metersTaken = 0;
-    attackerLossRate = 0.6;
-    defenderLossRate = 0.15;
-  } else {
-    result = "draw";
-    metersTaken = Math.floor(40 + Math.random() * 60);
-    attackerLossRate = 0.3;
-    defenderLossRate = 0.3;
-  }
+    for (let i = 0; i < attackers.length; i++) {
+      perAttackerMissilePick.push(pickTopN(attackers[i].missilesInventory as UnitInventory, MISSILES, missileForEach[i]));
+      perAttackerJetPick.push(pickTopN(attackers[i].jetsInventory as UnitInventory, JETS, jetForEach[i]));
+      perAttackerSoldier.push(solForEach[i]);
+    }
 
-  // انتقال polygon
-  let newDefenderPoly = defender.territoryPolygon as Polygon;
-  let newAttackerPoly = attackers[0].territoryPolygon as Polygon;
-  let areaTakenKm2 = 0;
-  if (metersTaken > 0) {
-    const before = polygonAreaKm2(newDefenderPoly);
-    const trans = transferTerritory(newAttackerPoly, newDefenderPoly, attackerLead, defenderCenter, metersTaken);
-    newAttackerPoly = trans.attacker;
-    newDefenderPoly = trans.defender;
-    const after = polygonAreaKm2(newDefenderPoly);
-    areaTakenKm2 = Math.max(0, before - after);
-  }
+    // ره‌گیری پدافند مدافع: موشک‌ها ممکنه ره‌گیری بشن
+    const defenseInv = (defender.defensesInventory ?? {}) as UnitInventory;
+    let interceptedMissiles = 0;
+    const combinedMissilePick: UnitPick = {};
+    for (const pick of perAttackerMissilePick) {
+      for (const [id, c] of Object.entries(pick)) combinedMissilePick[id] = (combinedMissilePick[id] ?? 0) + c;
+    }
+    const originalTotalPerMissileId: UnitPick = { ...combinedMissilePick };
 
-  // آسیب و تصرف کارخانه‌های مدافع
-  const defenderFactories = [...(((defender.factories as FactoryInstance[]) ?? []))];
-  const capturedFactories: FactoryInstance[] = [];
-  const remainingDefenderFactories: FactoryInstance[] = [];
-  if (result === "win" && defenderFactories.length > 0) {
-    // نسبت درصد تصرف بر اساس درصد خاک از دست رفته
-    const beforeArea = polygonAreaKm2(defender.territoryPolygon as Polygon);
-    const lossRatio = beforeArea > 0 ? Math.min(1, areaTakenKm2 / beforeArea) : 0;
-    for (const f of defenderFactories) {
-      if (Math.random() < lossRatio * 1.5) {
-        // این کارخونه تصرف شد؛ آسیبی هم ببینه
-        const damage = 20 + Math.floor(Math.random() * 40);
-        const health = Math.max(10, f.health - damage);
-        capturedFactories.push({ ...f, health });
-      } else {
-        // آسیب می‌بینه ولی می‌مونه دست مدافع
-        const damage = Math.floor(Math.random() * 25);
+    const combinedInterceptProb = (() => {
+      let survive = 1;
+      for (const [id, c] of Object.entries(defenseInv)) {
+        const u = UNIT_BY_ID[id];
+        if (!u) continue;
+        survive *= Math.pow(1 - u.interceptChance, c || 0);
+      }
+      return 1 - survive; // احتمال ره‌گیری هر موشک
+    })();
+    const survivorsPerMissileId: UnitPick = {};
+    for (const [id, c] of Object.entries(combinedMissilePick)) {
+      let survivors = 0;
+      for (let i = 0; i < c; i++) {
+        if (Math.random() > combinedInterceptProb) survivors++;
+        else interceptedMissiles++;
+      }
+      survivorsPerMissileId[id] = survivors;
+    }
+    for (const pick of perAttackerMissilePick) {
+      for (const id of Object.keys(pick)) {
+        const originalTotal = originalTotalPerMissileId[id] ?? 0;
+        if (originalTotal === 0) continue;
+        const survivorsTotal = survivorsPerMissileId[id] ?? 0;
+        pick[id] = Math.floor(((pick[id] ?? 0) / originalTotal) * survivorsTotal);
+      }
+    }
+
+    // محاسبه قدرت واقعی حمله (پس از ره‌گیری)
+    let attackPower = useSoldiers * SOLDIER_ATTACK;
+    for (const pick of perAttackerMissilePick) attackPower += powerOfPick(pick, "attack");
+    for (const pick of perAttackerJetPick) attackPower += powerOfPick(pick, "attack");
+
+    const defensePower = calcDefensePower(defender);
+    const ratio = attackPower / Math.max(1, defensePower);
+
+    let result: "win" | "lose" | "draw";
+    let metersTaken = 0;
+    let attackerLossRate: number;
+    let defenderLossRate: number;
+
+    const attackerLead = polygonCentroid(attackers[0].territoryPolygon as Polygon);
+    const defenderCenter = polygonCentroid(defender.territoryPolygon as Polygon);
+    const distanceBetween = haversineMeters(attackerLead, defenderCenter);
+    const maxAdvance = Math.max(150, distanceBetween * 0.4);
+
+    if (ratio >= 1.15) {
+      result = "win";
+      metersTaken = Math.min(maxAdvance, Math.floor(120 + ratio * 130));
+      attackerLossRate = 0.15 / Math.min(3, ratio);
+      defenderLossRate = 0.5 + Math.min(0.35, ratio * 0.12);
+    } else if (ratio <= 0.85) {
+      result = "lose";
+      metersTaken = 0;
+      attackerLossRate = 0.6;
+      defenderLossRate = 0.15;
+    } else {
+      result = "draw";
+      metersTaken = Math.floor(40 + Math.random() * 60);
+      attackerLossRate = 0.3;
+      defenderLossRate = 0.3;
+    }
+
+    // انتقال polygon
+    let newDefenderPoly = defender.territoryPolygon as Polygon;
+    let newAttackerPoly = attackers[0].territoryPolygon as Polygon;
+    let areaTakenKm2 = 0;
+    if (metersTaken > 0) {
+      const before = polygonAreaKm2(newDefenderPoly);
+      const trans = transferTerritory(newAttackerPoly, newDefenderPoly, attackerLead, defenderCenter, metersTaken);
+      newAttackerPoly = trans.attacker;
+      newDefenderPoly = trans.defender;
+      const after = polygonAreaKm2(newDefenderPoly);
+      areaTakenKm2 = Math.max(0, before - after);
+    }
+
+    // آسیب و تصرف کارخانه‌های مدافع
+    const defenderFactories = [...(((defender.factories as FactoryInstance[]) ?? []))];
+    const capturedFactories: FactoryInstance[] = [];
+    const remainingDefenderFactories: FactoryInstance[] = [];
+    if (result === "win" && defenderFactories.length > 0) {
+      const beforeArea = polygonAreaKm2(defender.territoryPolygon as Polygon);
+      const lossRatio = beforeArea > 0 ? Math.min(1, areaTakenKm2 / beforeArea) : 0;
+      for (const f of defenderFactories) {
+        if (Math.random() < lossRatio * 1.5) {
+          const damage = 20 + Math.floor(Math.random() * 40);
+          const health = Math.max(10, f.health - damage);
+          capturedFactories.push({ ...f, health });
+        } else {
+          const damage = Math.floor(Math.random() * 25);
+          remainingDefenderFactories.push({ ...f, health: Math.max(5, f.health - damage) });
+        }
+      }
+    } else {
+      for (const f of defenderFactories) {
+        const damage = Math.floor(Math.random() * (result === "draw" ? 15 : 8));
         remainingDefenderFactories.push({ ...f, health: Math.max(5, f.health - damage) });
       }
     }
-  } else {
-    // در تساوی/شکست هم کارخانه‌ها ممکنه آسیب ببینن
-    for (const f of defenderFactories) {
-      const damage = Math.floor(Math.random() * (result === "draw" ? 15 : 8));
-      remainingDefenderFactories.push({ ...f, health: Math.max(5, f.health - damage) });
+
+    // تلفات مدافع
+    const defenderSoldierLosses = Math.floor(defender.soldiers * defenderLossRate);
+    const damageDefensesInv = { ...defenseInv };
+    for (const id of Object.keys(damageDefensesInv)) {
+      damageDefensesInv[id] = Math.max(0, Math.floor(damageDefensesInv[id] * (1 - defenderLossRate * 0.5)));
     }
-  }
-
-  // تلفات مدافع
-  const defenderSoldierLosses = Math.floor(defender.soldiers * defenderLossRate);
-  const damageDefensesInv = { ...defenseInv };
-  for (const id of Object.keys(damageDefensesInv)) {
-    damageDefensesInv[id] = Math.max(0, Math.floor(damageDefensesInv[id] * (1 - defenderLossRate * 0.5)));
-  }
-  const defenderJetInv = { ...((defender.jetsInventory ?? {}) as UnitInventory) };
-  for (const id of Object.keys(defenderJetInv)) {
-    defenderJetInv[id] = Math.max(0, Math.floor(defenderJetInv[id] * (1 - defenderLossRate * 0.3)));
-  }
-  const defenderLossCount =
-    defenderSoldierLosses +
-    (invCount(defenseInv) - invCount(damageDefensesInv)) +
-    (invCount(defender.jetsInventory as UnitInventory) - invCount(defenderJetInv));
-
-  const remainingArea = polygonAreaKm2(newDefenderPoly);
-  const remainingPct = remainingArea / Math.max(0.001, defender.initialAreaKm2);
-  const defenderEliminated = remainingPct < 0.05;
-
-  // رفع باگ بحرانی: وقتی قبیله نابود می‌شه، ownerId رو هم پاک می‌کنیم.
-  // قبلاً فقط isAlive=false ست می‌شد ولی مالکیت باقی می‌موند، در نتیجه بازیکن
-  // بازنده برای همیشه "صاحب" یک قبیله مرده حساب می‌شد و چون claim route چک
-  // مالکیت رو با ownerId (نه isAlive) انجام می‌ده، دیگه هیچ‌وقت نمی‌تونست قبیله
-  // جدید بگیره مگر با کشف تصادفی دکمه‌ی "رها کردن قبیله".
-  await db.update(tribes).set({
-    soldiers: Math.max(0, defender.soldiers - defenderSoldierLosses),
-    defensesInventory: damageDefensesInv,
-    jetsInventory: defenderJetInv,
-    factories: remainingDefenderFactories,
-    territoryPolygon: newDefenderPoly,
-    isAlive: !defenderEliminated,
-    ...(defenderEliminated ? { ownerId: null, aiEnabled: false } : {}),
-    updatedAt: new Date(),
-  }).where(eq(tribes.id, defenderId));
-
-  // پاکسازی اتحادها و درخواست‌های اتحاد قبیله‌ی نابودشده (وگرنه لینک‌های
-  // یتیم به یک قبیله‌ی بدون مالک باقی می‌موندن)
-  if (defenderEliminated) {
-    await db.delete(alliances).where(
-      or(eq(alliances.tribeAId, defenderId), eq(alliances.tribeBId, defenderId))
-    );
-    await db.delete(allianceRequests).where(
-      or(eq(allianceRequests.fromTribeId, defenderId), eq(allianceRequests.toTribeId, defenderId))
-    );
-  }
-
-  // اعمال تلفات مهاجم‌ها + کسر مصرف موشک/جنگنده + اضافه کارخانه‌های تصرف‌شده به مهاجم اصلی
-  for (let i = 0; i < attackers.length; i++) {
-    const a = attackers[i];
-    const newSol = Math.max(0, a.soldiers - Math.floor(perAttackerSoldier[i] * attackerLossRate));
-    // موشک‌های مصرفی از انبار کسر
-    const newMi = { ...((a.missilesInventory ?? {}) as UnitInventory) };
-    // مصرف = کل موشک‌های تخصیص داده شده (چه ره‌گیری بشن چه نشن)
-    // اما perAttackerMissilePick بعد از ره‌گیری فقط بقا رو نشون می‌ده — بذاریم پیش از ره‌گیری بود
-    // برای سادگی: کل تخصیص را از انبار کسر می‌کنیم (استفاده شد)
-    const originalMissilePick = pickTopN(a.missilesInventory as UnitInventory, MISSILES, missileForEach[i]);
-    for (const [id, c] of Object.entries(originalMissilePick)) {
-      newMi[id] = Math.max(0, (newMi[id] ?? 0) - c);
+    const defenderJetInv = { ...((defender.jetsInventory ?? {}) as UnitInventory) };
+    for (const id of Object.keys(defenderJetInv)) {
+      defenderJetInv[id] = Math.max(0, Math.floor(defenderJetInv[id] * (1 - defenderLossRate * 0.3)));
     }
-    // جنگنده‌ها: بخشی از دست می‌ره
-    const newJt = { ...((a.jetsInventory ?? {}) as UnitInventory) };
-    const jetPick = pickTopN(a.jetsInventory as UnitInventory, JETS, jetForEach[i]);
-    for (const [id, c] of Object.entries(jetPick)) {
-      const losses = Math.floor(c * attackerLossRate * 0.4);
-      newJt[id] = Math.max(0, (newJt[id] ?? 0) - losses);
-    }
-    const updates: Partial<typeof tribes.$inferInsert> = {
-      soldiers: newSol,
-      missilesInventory: newMi,
-      jetsInventory: newJt,
+    const defenderLossCount =
+      defenderSoldierLosses +
+      (invCount(defenseInv) - invCount(damageDefensesInv)) +
+      (invCount(defender.jetsInventory as UnitInventory) - invCount(defenderJetInv));
+
+    const remainingArea = polygonAreaKm2(newDefenderPoly);
+    const remainingPct = remainingArea / Math.max(0.001, defender.initialAreaKm2);
+    const defenderEliminated = remainingPct < 0.05;
+
+    // رفع باگ بحرانی: وقتی قبیله نابود می‌شه، ownerId رو هم پاک می‌کنیم.
+    // قبلاً فقط isAlive=false ست می‌شد ولی مالکیت باقی می‌موند، در نتیجه بازیکن
+    // بازنده برای همیشه "صاحب" یک قبیله مرده حساب می‌شد.
+    await tx.update(tribes).set({
+      soldiers: Math.max(0, defender.soldiers - defenderSoldierLosses),
+      defensesInventory: damageDefensesInv,
+      jetsInventory: defenderJetInv,
+      factories: remainingDefenderFactories,
+      territoryPolygon: newDefenderPoly,
+      isAlive: !defenderEliminated,
+      ...(defenderEliminated ? { ownerId: null, aiEnabled: false } : {}),
       updatedAt: new Date(),
-    };
-    if (i === 0) {
-      updates.territoryPolygon = newAttackerPoly;
-      // کارخانه‌های تصرف شده به مهاجم اصلی
+    }).where(eq(tribes.id, defenderId));
+
+    // پاکسازی اتحادها و درخواست‌های اتحاد قبیله‌ی نابودشده
+    if (defenderEliminated) {
+      await tx.delete(alliances).where(
+        or(eq(alliances.tribeAId, defenderId), eq(alliances.tribeBId, defenderId))
+      );
+      await tx.delete(allianceRequests).where(
+        or(eq(allianceRequests.fromTribeId, defenderId), eq(allianceRequests.toTribeId, defenderId))
+      );
+    }
+
+    // اعمال تلفات مهاجم‌ها + کسر مصرف موشک/جنگنده + اضافه کارخانه‌های تصرف‌شده به مهاجم اصلی
+    for (let i = 0; i < attackers.length; i++) {
+      const a = attackers[i];
+      const newSol = Math.max(0, a.soldiers - Math.floor(perAttackerSoldier[i] * attackerLossRate));
+      const newMi = { ...((a.missilesInventory ?? {}) as UnitInventory) };
+      const originalMissilePick = pickTopN(a.missilesInventory as UnitInventory, MISSILES, missileForEach[i]);
+      for (const [id, c] of Object.entries(originalMissilePick)) {
+        newMi[id] = Math.max(0, (newMi[id] ?? 0) - c);
+      }
+      const newJt = { ...((a.jetsInventory ?? {}) as UnitInventory) };
+      const jetPick = pickTopN(a.jetsInventory as UnitInventory, JETS, jetForEach[i]);
+      for (const [id, c] of Object.entries(jetPick)) {
+        const losses = Math.floor(c * attackerLossRate * 0.4);
+        newJt[id] = Math.max(0, (newJt[id] ?? 0) - losses);
+      }
+      const updates: Partial<typeof tribes.$inferInsert> = {
+        soldiers: newSol,
+        missilesInventory: newMi,
+        jetsInventory: newJt,
+        updatedAt: new Date(),
+      };
+      if (i === 0) {
+        updates.territoryPolygon = newAttackerPoly;
+        if (capturedFactories.length > 0) {
+          const myFactories = [...(((a.factories as FactoryInstance[]) ?? []))];
+          for (const cf of capturedFactories) myFactories.push(cf);
+          updates.factories = myFactories;
+        }
+      }
+      await tx.update(tribes).set(updates).where(eq(tribes.id, a.id));
+    }
+
+    const attackerLossCount = Math.floor(useSoldiers * attackerLossRate) + Math.floor(useJetTotal * attackerLossRate * 0.4);
+
+    // narrative
+    const landmark = nearestLandmark(defenderCenter[0], defenderCenter[1]);
+    const attackerNames = attackers.map((a) => a.name).join(" + ");
+    const usedUnitsSummary = summarizePicks(perAttackerMissilePick, perAttackerJetPick, useSoldiers);
+    let narrative = "";
+    if (result === "win") {
+      narrative = `${attackerNames} با ${usedUnitsSummary} به قلمرو ${defender.name} در نزدیکی ${landmark} یورش برد. ${interceptedMissiles > 0 ? `پدافند دشمن ${interceptedMissiles} موشک را ره‌گیری کرد اما ` : ""}حدود ${metersTaken} متر (${areaTakenKm2.toFixed(3)} km²) از خاک تصرف شد.`;
       if (capturedFactories.length > 0) {
-        const myFactories = [...(((a.factories as FactoryInstance[]) ?? []))];
-        for (const cf of capturedFactories) myFactories.push(cf);
-        updates.factories = myFactories;
+        const names = capturedFactories.map((f) => FACTORY_BY_ID[f.id]?.name ?? f.id).join("، ");
+        narrative += ` 🏭 کارخانه‌های تصرف شده: ${names}`;
+      }
+    } else if (result === "lose") {
+      narrative = `حمله ${attackerNames} با ${usedUnitsSummary} به ${defender.name} در ${landmark} با شکست مواجه شد. ${interceptedMissiles > 0 ? `پدافند ${interceptedMissiles} موشک را ره‌گیری کرد. ` : ""}مقاومت شدید دشمن!`;
+    } else {
+      narrative = `نبرد ${attackerNames} با ${defender.name} در ${landmark} به تساوی کشید. ${metersTaken} متر جابجایی مرز.`;
+    }
+    if (defenderEliminated) narrative += ` 💀 قبیله ${defender.name} از نقشه محو شد!`;
+
+    await tx.insert(attackLogs).values({
+      serverId,
+      attackerId: attackers[0].id,
+      defenderId,
+      attackerName: attackerNames,
+      defenderName: defender.name,
+      attackPower,
+      defensePower,
+      metersTaken,
+      areaTakenKm2,
+      attackerLosses: attackerLossCount,
+      defenderLosses: defenderLossCount,
+      interceptedMissiles,
+      capturedFactories,
+      result,
+      narrative,
+    });
+
+    // آمار مالک
+    if (attackers[0].ownerId) {
+      const [owner] = await tx.select().from(users).where(eq(users.id, attackers[0].ownerId));
+      if (owner) {
+        await tx.update(users).set({
+          attacksLaunched: owner.attacksLaunched + 1,
+          wins: owner.wins + (result === "win" ? 1 : 0),
+          losses: owner.losses + (result === "lose" ? 1 : 0),
+          totalTerritoryGained: owner.totalTerritoryGained + metersTaken,
+        }).where(eq(users.id, owner.id));
       }
     }
-    await db.update(tribes).set(updates).where(eq(tribes.id, a.id));
-  }
 
-  const attackerLossCount = Math.floor(useSoldiers * attackerLossRate) + Math.floor(useJetTotal * attackerLossRate * 0.4);
-
-  // narrative
-  const landmark = nearestLandmark(defenderCenter[0], defenderCenter[1]);
-  const attackerNames = attackers.map((a) => a.name).join(" + ");
-  const usedUnitsSummary = summarizePicks(perAttackerMissilePick, perAttackerJetPick, useSoldiers);
-  let narrative = "";
-  if (result === "win") {
-    narrative = `${attackerNames} با ${usedUnitsSummary} به قلمرو ${defender.name} در نزدیکی ${landmark} یورش برد. ${interceptedMissiles > 0 ? `پدافند دشمن ${interceptedMissiles} موشک را ره‌گیری کرد اما ` : ""}حدود ${metersTaken} متر (${areaTakenKm2.toFixed(3)} km²) از خاک تصرف شد.`;
-    if (capturedFactories.length > 0) {
-      const names = capturedFactories.map((f) => FACTORY_BY_ID[f.id]?.name ?? f.id).join("، ");
-      narrative += ` 🏭 کارخانه‌های تصرف شده: ${names}`;
-    }
-  } else if (result === "lose") {
-    narrative = `حمله ${attackerNames} با ${usedUnitsSummary} به ${defender.name} در ${landmark} با شکست مواجه شد. ${interceptedMissiles > 0 ? `پدافند ${interceptedMissiles} موشک را ره‌گیری کرد. ` : ""}مقاومت شدید دشمن!`;
-  } else {
-    narrative = `نبرد ${attackerNames} با ${defender.name} در ${landmark} به تساوی کشید. ${metersTaken} متر جابجایی مرز.`;
-  }
-  if (defenderEliminated) narrative += ` 💀 قبیله ${defender.name} از نقشه محو شد!`;
-
-  await db.insert(attackLogs).values({
-    serverId,
-    attackerId: attackers[0].id,
-    defenderId,
-    attackerName: attackerNames,
-    defenderName: defender.name,
-    attackPower,
-    defensePower,
-    metersTaken,
-    areaTakenKm2,
-    attackerLosses: attackerLossCount,
-    defenderLosses: defenderLossCount,
-    interceptedMissiles,
-    capturedFactories,
-    result,
-    narrative,
+    return {
+      success: true,
+      message: result === "win" ? `پیروزی! ${metersTaken}m تصرف` : result === "lose" ? "شکست" : "تساوی",
+      attackPower, defensePower, metersTaken, areaTakenKm2,
+      attackerLosses: attackerLossCount, defenderLosses: defenderLossCount,
+      interceptedMissiles, capturedFactories, result, defenderEliminated, narrative,
+    };
   });
-
-  // آمار مالک
-  if (attackers[0].ownerId) {
-    const [owner] = await db.select().from(users).where(eq(users.id, attackers[0].ownerId));
-    if (owner) {
-      await db.update(users).set({
-        attacksLaunched: owner.attacksLaunched + 1,
-        wins: owner.wins + (result === "win" ? 1 : 0),
-        losses: owner.losses + (result === "lose" ? 1 : 0),
-        totalTerritoryGained: owner.totalTerritoryGained + metersTaken,
-      }).where(eq(users.id, owner.id));
-    }
-  }
-
-  return {
-    success: true,
-    message: result === "win" ? `پیروزی! ${metersTaken}m تصرف` : result === "lose" ? "شکست" : "تساوی",
-    attackPower, defensePower, metersTaken, areaTakenKm2,
-    attackerLosses: attackerLossCount, defenderLosses: defenderLossCount,
-    interceptedMissiles, capturedFactories, result, defenderEliminated, narrative,
-  };
 }
 
 function summarizePicks(mi: UnitPick[], jt: UnitPick[], soldiers: number): string {
@@ -627,77 +629,84 @@ function summarizePicks(mi: UnitPick[], jt: UnitPick[], soldiers: number): strin
 // ارسال درخواست اتحاد (به‌جای ایجاد فوری اتحاد)
 export async function sendAllianceRequest(serverId: number, fromId: number, toId: number) {
   if (fromId === toId) throw new Error("قبیله با خودش نمی‌تواند متحد شود");
-  if (await areAllied(fromId, toId)) throw new Error("این دو از قبل متحدند");
 
-  // رفع باگ: قبلاً فقط قبیله‌ی مقصد چک می‌شد؛ اگر قبیله‌ی خودمون (fromId) به هر
-  // دلیلی نابود شده باشه (حالت لبه‌ای/race condition)، نباید بتونه درخواست بفرسته
-  const [fromTribe] = await db.select().from(tribes).where(eq(tribes.id, fromId));
-  if (!fromTribe) throw new Error("قبیله شما یافت نشد");
-  if (!fromTribe.isAlive) throw new Error("قبیله شما نابود شده است");
+  // رفع باگ race condition: کل بررسی و درج در یک تراکنش انجام می‌شه تا دو
+  // درخواست هم‌زمان (مثلاً دوبار کلیک سریع) باعث ساخت دو ردیف تکراری نشن
+  return db.transaction(async (tx) => {
+    if (await areAllied(fromId, toId, tx)) throw new Error("این دو از قبل متحدند");
 
-  const [toTribe] = await db.select().from(tribes).where(eq(tribes.id, toId));
-  if (!toTribe) throw new Error("قبیله مقصد یافت نشد");
-  if (!toTribe.isAlive) throw new Error("این قبیله نابود شده است");
-  if (!toTribe.ownerId) throw new Error("این قبیله مالک ندارد و نمی‌تواند درخواست اتحاد را تأیید کند");
+    const [fromTribe] = await tx.select().from(tribes).where(eq(tribes.id, fromId));
+    if (!fromTribe) throw new Error("قبیله شما یافت نشد");
+    if (!fromTribe.isAlive) throw new Error("قبیله شما نابود شده است");
 
-  // اگر درخواست معکوس (toId -> fromId) از قبل pending باشه، یعنی هر دو طرف مایلن — فوراً متحد کن
-  const [reverseReq] = await db
-    .select()
-    .from(allianceRequests)
-    .where(and(
-      eq(allianceRequests.fromTribeId, toId),
-      eq(allianceRequests.toTribeId, fromId),
-      eq(allianceRequests.status, "pending")
-    ));
-  if (reverseReq) {
-    await db.update(allianceRequests).set({ status: "accepted", respondedAt: new Date() }).where(eq(allianceRequests.id, reverseReq.id));
-    await db.insert(alliances).values({ serverId, tribeAId: fromId, tribeBId: toId });
-    return { success: true, autoAccepted: true };
-  }
+    const [toTribe] = await tx.select().from(tribes).where(eq(tribes.id, toId));
+    if (!toTribe) throw new Error("قبیله مقصد یافت نشد");
+    if (!toTribe.isAlive) throw new Error("این قبیله نابود شده است");
+    if (!toTribe.ownerId) throw new Error("این قبیله مالک ندارد و نمی‌تواند درخواست اتحاد را تأیید کند");
 
-  // آیا از قبل یک درخواست pending از fromId به toId وجود داره؟
-  const [existing] = await db
-    .select()
-    .from(allianceRequests)
-    .where(and(
-      eq(allianceRequests.fromTribeId, fromId),
-      eq(allianceRequests.toTribeId, toId),
-      eq(allianceRequests.status, "pending")
-    ));
-  if (existing) throw new Error("قبلاً درخواست اتحاد فرستاده‌ای، منتظر پاسخ باش");
+    // اگر درخواست معکوس (toId -> fromId) از قبل pending باشه، یعنی هر دو طرف مایلن — فوراً متحد کن
+    const [reverseReq] = await tx
+      .select()
+      .from(allianceRequests)
+      .where(and(
+        eq(allianceRequests.fromTribeId, toId),
+        eq(allianceRequests.toTribeId, fromId),
+        eq(allianceRequests.status, "pending")
+      ));
+    if (reverseReq) {
+      await tx.update(allianceRequests).set({ status: "accepted", respondedAt: new Date() }).where(eq(allianceRequests.id, reverseReq.id));
+      await tx.insert(alliances).values({ serverId, tribeAId: fromId, tribeBId: toId });
+      return { success: true, autoAccepted: true };
+    }
 
-  await db.insert(allianceRequests).values({ serverId, fromTribeId: fromId, toTribeId: toId, status: "pending" });
-  return { success: true, autoAccepted: false };
+    const [existing] = await tx
+      .select()
+      .from(allianceRequests)
+      .where(and(
+        eq(allianceRequests.fromTribeId, fromId),
+        eq(allianceRequests.toTribeId, toId),
+        eq(allianceRequests.status, "pending")
+      ));
+    if (existing) throw new Error("قبلاً درخواست اتحاد فرستاده‌ای، منتظر پاسخ باش");
+
+    await tx.insert(allianceRequests).values({ serverId, fromTribeId: fromId, toTribeId: toId, status: "pending" });
+    return { success: true, autoAccepted: false };
+  });
 }
 
 // پاسخ به یک درخواست اتحاد (فقط گیرنده درخواست می‌تواند پاسخ بده)
 export async function respondAllianceRequest(requestId: number, myTribeId: number, accept: boolean) {
-  const [req] = await db.select().from(allianceRequests).where(eq(allianceRequests.id, requestId));
-  if (!req) throw new Error("درخواست یافت نشد");
-  if (req.toTribeId !== myTribeId) throw new Error("این درخواست برای شما نیست");
-  if (req.status !== "pending") throw new Error("این درخواست قبلاً پاسخ داده شده");
+  // رفع باگ race condition: بررسی وضعیت pending و آپدیت آن به‌صورت اتمیک
+  return db.transaction(async (tx) => {
+    const [req] = await tx.select().from(allianceRequests).where(eq(allianceRequests.id, requestId)).for("update");
+    if (!req) throw new Error("درخواست یافت نشد");
+    if (req.toTribeId !== myTribeId) throw new Error("این درخواست برای شما نیست");
+    if (req.status !== "pending") throw new Error("این درخواست قبلاً پاسخ داده شده");
 
-  if (accept) {
-    if (await areAllied(req.fromTribeId, req.toTribeId)) {
-      await db.update(allianceRequests).set({ status: "accepted", respondedAt: new Date() }).where(eq(allianceRequests.id, requestId));
-      return { success: true };
+    if (accept) {
+      if (await areAllied(req.fromTribeId, req.toTribeId, tx)) {
+        await tx.update(allianceRequests).set({ status: "accepted", respondedAt: new Date() }).where(eq(allianceRequests.id, requestId));
+        return { success: true };
+      }
+      await tx.insert(alliances).values({ serverId: req.serverId, tribeAId: req.fromTribeId, tribeBId: req.toTribeId });
+      await tx.update(allianceRequests).set({ status: "accepted", respondedAt: new Date() }).where(eq(allianceRequests.id, requestId));
+    } else {
+      await tx.update(allianceRequests).set({ status: "rejected", respondedAt: new Date() }).where(eq(allianceRequests.id, requestId));
     }
-    await db.insert(alliances).values({ serverId: req.serverId, tribeAId: req.fromTribeId, tribeBId: req.toTribeId });
-    await db.update(allianceRequests).set({ status: "accepted", respondedAt: new Date() }).where(eq(allianceRequests.id, requestId));
-  } else {
-    await db.update(allianceRequests).set({ status: "rejected", respondedAt: new Date() }).where(eq(allianceRequests.id, requestId));
-  }
-  return { success: true };
+    return { success: true };
+  });
 }
 
 // لغو درخواست ارسالی توسط خود فرستنده
 export async function cancelAllianceRequest(requestId: number, myTribeId: number) {
-  const [req] = await db.select().from(allianceRequests).where(eq(allianceRequests.id, requestId));
-  if (!req) throw new Error("درخواست یافت نشد");
-  if (req.fromTribeId !== myTribeId) throw new Error("این درخواست از شما نیست");
-  if (req.status !== "pending") throw new Error("این درخواست دیگر در انتظار نیست");
-  await db.update(allianceRequests).set({ status: "cancelled", respondedAt: new Date() }).where(eq(allianceRequests.id, requestId));
-  return { success: true };
+  return db.transaction(async (tx) => {
+    const [req] = await tx.select().from(allianceRequests).where(eq(allianceRequests.id, requestId)).for("update");
+    if (!req) throw new Error("درخواست یافت نشد");
+    if (req.fromTribeId !== myTribeId) throw new Error("این درخواست از شما نیست");
+    if (req.status !== "pending") throw new Error("این درخواست دیگر در انتظار نیست");
+    await tx.update(allianceRequests).set({ status: "cancelled", respondedAt: new Date() }).where(eq(allianceRequests.id, requestId));
+    return { success: true };
+  });
 }
 
 export async function getPendingRequestsFor(tribeId: number) {
