@@ -20,11 +20,21 @@ export async function POST(req: Request) {
     if (username.length < 3 || username.length > 32) {
       return NextResponse.json({ success: false, error: "یوزرنیم باید بین ۳ تا ۳۲ کاراکتر باشد" }, { status: 400 });
     }
+    // رفع باگ: قبلاً هیچ محدودیتی روی کاراکترهای یوزرنیم نبود — کاربر می‌تونست
+    // کاراکترهای کنترلی، RTL-override (برای گمراه کردن بقیه کاربران با نمایش
+    // معکوس اسم) یا فاصله‌های نامرئی رو در یوزرنیم بذاره. حالا فقط حروف/عدد
+    // انگلیسی و خط زیر/تیره مجازن — یوزرنیم صرفاً برای ورود استفاده می‌شه.
+    if (!/^[a-zA-Z0-9_-]+$/.test(username)) {
+      return NextResponse.json({ success: false, error: "یوزرنیم فقط می‌تواند شامل حروف انگلیسی، عدد، خط تیره و زیرخط باشد" }, { status: 400 });
+    }
     if (password.length < 4 || password.length > 128) {
       return NextResponse.json({ success: false, error: "پسورد باید بین ۴ تا ۱۲۸ کاراکتر باشد" }, { status: 400 });
     }
-    const displayName = (displayNameRaw || username).slice(0, 40);
-    const avatar = (avatarRaw || "🎯").slice(0, 8);
+    // حذف کاراکترهای کنترلی/غیرقابل‌چاپ از displayName و avatar (رفع باگ مشابه امنیتی)
+    const cleanDisplayName = displayNameRaw.replace(/[\u0000-\u001F\u007F]/g, "");
+    const cleanAvatar = avatarRaw.replace(/[\u0000-\u001F\u007F]/g, "");
+    const displayName = (cleanDisplayName || username).slice(0, 40);
+    const avatar = (cleanAvatar || "🎯").slice(0, 8);
 
     const [exists] = await db.select().from(users).where(eq(users.username, username));
     if (exists) {

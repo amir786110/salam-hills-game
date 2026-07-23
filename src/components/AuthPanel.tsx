@@ -100,6 +100,9 @@ export default function AuthPanel({ onSuccess, errorBanner }: Props) {
             <input
               value={username}
               onChange={(e) => setUsername(e.target.value)}
+              // رفع باگ UX: قبلاً فرم فقط با کلیک روی دکمه ارسال می‌شد. حالا با
+              // زدن Enter در هر کدوم از فیلدها هم فرم ارسال می‌شه (رفتار استاندارد فرم‌های ورود)
+              onKeyDown={(e) => { if (e.key === "Enter" && username && password && !loading) submit(); }}
               className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm"
               placeholder="مثلاً ali123"
               dir="ltr"
@@ -111,6 +114,7 @@ export default function AuthPanel({ onSuccess, errorBanner }: Props) {
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && username && password && !loading) submit(); }}
               className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm"
               placeholder="حداقل ۴ کاراکتر"
               dir="ltr"

@@ -13,10 +13,12 @@ export async function POST(req: Request) {
   const { displayName, avatar } = body;
   const patch: { displayName?: string; avatar?: string } = {};
   if (typeof displayName === "string" && displayName.trim().length > 0) {
-    patch.displayName = displayName.trim().slice(0, 40);
+    // رفع باگ: حذف کاراکترهای کنترلی/غیرقابل‌چاپ که می‌تونستن باعث مشکلات
+    // نمایشی یا encoding بشن (مثلاً کاراکترهای null یا newline در اسم)
+    patch.displayName = displayName.trim().replace(/[\u0000-\u001F\u007F]/g, "").slice(0, 40);
   }
   if (typeof avatar === "string" && avatar.length > 0) {
-    patch.avatar = avatar.slice(0, 8);
+    patch.avatar = avatar.replace(/[\u0000-\u001F\u007F]/g, "").slice(0, 8);
   }
   if (Object.keys(patch).length === 0) {
     return NextResponse.json({ success: false, error: "چیزی برای تغییر نیست" }, { status: 400 });

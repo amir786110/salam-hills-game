@@ -131,6 +131,11 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
   // درخواست‌های اتحاد (رفع باگ اتحاد یک‌طرفه — حالا نیاز به تأیید طرفین داره)
   const [incomingRequests, setIncomingRequests] = useState<AllianceRequestRec[]>([]);
   const [outgoingRequests, setOutgoingRequests] = useState<AllianceRequestRec[]>([]);
+  // رفع باگ کلیک مکرر (double-submit): بدون این، اگه کاربر سریع چند بار روی
+  // دکمه‌ی خرید/حمله/اتحاد بزنه، چند درخواست واقعی هم‌زمان ارسال می‌شه —
+  // مثلاً چند حمله‌ی واقعی یا چند خرید به‌جای یکی. با این state، در حین
+  // پردازش هر عملیات، تمام دکمه‌های اکشن غیرفعال می‌شن.
+  const [isBusy, setIsBusy] = useState(false);
 
   const fetchState = useCallback(async () => {
     try {
@@ -208,6 +213,8 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
   };
 
   const claim = async (tribeId: number): Promise<boolean> => {
+    if (isBusy) return false;
+    setIsBusy(true);
     const res = await apiFetch(`/api/servers/${slug}/claim`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ tribeId }),
@@ -215,6 +222,7 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
     const data = await safeJson(res);
     if (!data.success) {
       showMsg((data.error as string) || "خطا در گرفتن قبیله", "error");
+      setIsBusy(false);
       return false;
     }
     // به‌روزرسانی خوش‌بینانه: بلافاصله state محلی رو تغییر بده تا UI نپرد
@@ -234,6 +242,7 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
     setTargetId(null);
     setAlliesForAttack([]);
     showMsg("🎉 تبریک! رهبر قبیله شدی — بازی رسماً شروع شد!", "success");
+    setIsBusy(false);
     // بعد از یه لحظه state رو از سرور sync کن (بدون بلاک کردن UI)
     fetchState();
     // advice رو در پس‌زمینه بگیر
@@ -249,44 +258,69 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
       "با رها کردن قبیله:\n\n• از مالکیتت خارج می‌شه\n• قلمرو به حالت اولیه Voronoi برمی‌گرده\n• همه منابع، سرباز، تسلیحات و کارخانه‌ها ریست می‌شن\n• قبیله برای بازیکنان دیگه قابل گرفتنه\n\nمطمئنی؟"
     );
     if (!ok) return;
-    await apiFetch(`/api/servers/${slug}/claim`, { method: "DELETE" });
-    setSelectedId(null);
-    setTab("buy");
-    await fetchState();
+    if (isBusy) return;
+    setIsBusy(true);
+    try {
+      await apiFetch(`/api/servers/${slug}/claim`, { method: "DELETE" });
+      setSelectedId(null);
+      setTab("buy");
+      await fetchState();
+    } finally {
+      setIsBusy(false);
+    }
   };
 
   const buyUnit = async (unitId: string, qty: number) => {
-    const res = await apiFetch(`/api/servers/${slug}/action/buy`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kind: "unit", unitId, quantity: qty }),
-    });
-    const data = await safeJson(res);
-    if (data.success) { showMsg("خرید موفق", "success"); await fetchState(); }
-    else showMsg((data.error as string) || "خطا", "error");
+    if (isBusy) return;
+    setIsBusy(true);
+    try {
+      const res = await apiFetch(`/api/servers/${slug}/action/buy`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "unit", unitId, quantity: qty }),
+      });
+      const data = await safeJson(res);
+      if (data.success) { showMsg("خرید موفق", "success"); await fetchState(); }
+      else showMsg((data.error as string) || "خطا", "error");
+    } finally {
+      setIsBusy(false);
+    }
   };
 
   const buySoldier = async (qty: number) => {
-    const res = await apiFetch(`/api/servers/${slug}/action/buy`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kind: "soldier", quantity: qty }),
-    });
-    const data = await safeJson(res);
-    if (data.success) { showMsg(`${qty} سرباز خریدی`, "success"); await fetchState(); }
-    else showMsg((data.error as string) || "خطا", "error");
+    if (isBusy) return;
+    setIsBusy(true);
+    try {
+      const res = await apiFetch(`/api/servers/${slug}/action/buy`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "soldier", quantity: qty }),
+      });
+      const data = await safeJson(res);
+      if (data.success) { showMsg(`${qty} سرباز خریدی`, "success"); await fetchState(); }
+      else showMsg((data.error as string) || "خطا", "error");
+    } finally {
+      setIsBusy(false);
+    }
   };
 
   const factoryAction = async (kind: "factory_build" | "factory_upgrade" | "factory_repair", factoryId: string, percent?: number) => {
-    const res = await apiFetch(`/api/servers/${slug}/action/buy`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kind, factoryId, percent }),
-    });
-    const data = await safeJson(res);
-    if (data.success) { showMsg("انجام شد", "success"); await fetchState(); }
-    else showMsg((data.error as string) || "خطا", "error");
+    if (isBusy) return;
+    setIsBusy(true);
+    try {
+      const res = await apiFetch(`/api/servers/${slug}/action/buy`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind, factoryId, percent }),
+      });
+      const data = await safeJson(res);
+      if (data.success) { showMsg("انجام شد", "success"); await fetchState(); }
+      else showMsg((data.error as string) || "خطا", "error");
+    } finally {
+      setIsBusy(false);
+    }
   };
 
   const attack = async () => {
     if (!target || !myTribe) return;
+    if (isBusy) return;
     // رفع باگ: قبل از ارسال، مقادیر رو به سقف واقعی محدود کن (کلاینت ممکنه state
     // قدیمی داشته باشه، سرور هم چک می‌کنه ولی بهتره پیام خطای گیج‌کننده نگیره)
     const safeSoldiers = Math.min(useSoldiers, totalSoldiers);
@@ -296,72 +330,101 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
       showMsg("حداقل یک نوع نیرو باید اعزام کنی", "error");
       return;
     }
-    const res = await apiFetch(`/api/servers/${slug}/action/attack`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        alliesIds: alliesForAttack, defenderId: target.id,
-        useSoldiers: safeSoldiers, useMissileTotal: safeMissiles, useJetTotal: safeJets,
-      }),
-    });
-    const data = await safeJson(res);
-    if (data.success) {
-      showMsg((data.narrative as string) || (data.message as string) || "حمله انجام شد", data.result === "win" ? "success" : data.result === "lose" ? "error" : "info");
-      setUseSoldiers(0); setUseMissileTotal(0); setUseJetTotal(0);
-      setAlliesForAttack([]);
-      await fetchState();
-    } else {
-      showMsg((data.error as string) || "خطا در حمله", "error");
+    setIsBusy(true);
+    try {
+      const res = await apiFetch(`/api/servers/${slug}/action/attack`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          alliesIds: alliesForAttack, defenderId: target.id,
+          useSoldiers: safeSoldiers, useMissileTotal: safeMissiles, useJetTotal: safeJets,
+        }),
+      });
+      const data = await safeJson(res);
+      if (data.success) {
+        showMsg((data.narrative as string) || (data.message as string) || "حمله انجام شد", data.result === "win" ? "success" : data.result === "lose" ? "error" : "info");
+        setUseSoldiers(0); setUseMissileTotal(0); setUseJetTotal(0);
+        setAlliesForAttack([]);
+        await fetchState();
+      } else {
+        showMsg((data.error as string) || "خطا در حمله", "error");
+      }
+    } finally {
+      setIsBusy(false);
     }
   };
 
   // ارسال درخواست اتحاد (نیاز به تأیید طرف مقابل — رفع باگ اتحاد یک‌طرفه)
   const propose = async (otherId: number) => {
-    const res = await apiFetch(`/api/servers/${slug}/action/alliance`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ otherTribeId: otherId }),
-    });
-    const data = await safeJson(res);
-    if (data.success) {
-      showMsg(data.autoAccepted ? "اتحاد برقرار شد 🤝" : "درخواست اتحاد فرستاده شد 📨 — منتظر تأیید طرف مقابل باش", "success");
-      await fetchState();
-      await fetchAllianceRequests();
-    } else {
-      showMsg((data.error as string) || "خطا", "error");
+    if (isBusy) return;
+    setIsBusy(true);
+    try {
+      const res = await apiFetch(`/api/servers/${slug}/action/alliance`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ otherTribeId: otherId }),
+      });
+      const data = await safeJson(res);
+      if (data.success) {
+        showMsg(data.autoAccepted ? "اتحاد برقرار شد 🤝" : "درخواست اتحاد فرستاده شد 📨 — منتظر تأیید طرف مقابل باش", "success");
+        await fetchState();
+        await fetchAllianceRequests();
+      } else {
+        showMsg((data.error as string) || "خطا", "error");
+      }
+    } finally {
+      setIsBusy(false);
     }
   };
   const breakAlly = async (otherId: number) => {
-    const res = await apiFetch(`/api/servers/${slug}/action/alliance`, {
-      method: "DELETE", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ otherTribeId: otherId }),
-    });
-    const data = await safeJson(res);
-    if (data.success) { showMsg("اتحاد شکسته شد", "info"); await fetchState(); }
-    else showMsg((data.error as string) || "خطا", "error");
+    if (isBusy) return;
+    setIsBusy(true);
+    try {
+      const res = await apiFetch(`/api/servers/${slug}/action/alliance`, {
+        method: "DELETE", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ otherTribeId: otherId }),
+      });
+      const data = await safeJson(res);
+      if (data.success) { showMsg("اتحاد شکسته شد", "info"); await fetchState(); }
+      else showMsg((data.error as string) || "خطا", "error");
+    } finally {
+      setIsBusy(false);
+    }
   };
 
   const respondToRequest = async (requestId: number, accept: boolean) => {
-    const res = await apiFetch(`/api/servers/${slug}/action/alliance-respond`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ requestId, accept }),
-    });
-    const data = await safeJson(res);
-    if (data.success) {
-      showMsg(accept ? "اتحاد رو قبول کردی 🤝" : "درخواست رد شد", accept ? "success" : "info");
-      await fetchState();
-      await fetchAllianceRequests();
-    } else {
-      showMsg((data.error as string) || "خطا", "error");
+    if (isBusy) return;
+    setIsBusy(true);
+    try {
+      const res = await apiFetch(`/api/servers/${slug}/action/alliance-respond`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ requestId, accept }),
+      });
+      const data = await safeJson(res);
+      if (data.success) {
+        showMsg(accept ? "اتحاد رو قبول کردی 🤝" : "درخواست رد شد", accept ? "success" : "info");
+        await fetchState();
+        await fetchAllianceRequests();
+      } else {
+        showMsg((data.error as string) || "خطا", "error");
+      }
+    } finally {
+      setIsBusy(false);
     }
   };
 
   const cancelRequest = async (requestId: number) => {
-    const res = await apiFetch(`/api/servers/${slug}/action/alliance-respond`, {
-      method: "DELETE", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ requestId }),
-    });
-    const data = await safeJson(res);
-    if (data.success) { showMsg("درخواست لغو شد", "info"); await fetchAllianceRequests(); }
-    else showMsg((data.error as string) || "خطا", "error");
+    if (isBusy) return;
+    setIsBusy(true);
+    try {
+      const res = await apiFetch(`/api/servers/${slug}/action/alliance-respond`, {
+        method: "DELETE", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ requestId }),
+      });
+      const data = await safeJson(res);
+      if (data.success) { showMsg("درخواست لغو شد", "info"); await fetchAllianceRequests(); }
+      else showMsg((data.error as string) || "خطا", "error");
+    } finally {
+      setIsBusy(false);
+    }
   };
 
   const askAdvice = async () => {
@@ -378,13 +441,19 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
 
   const sendBroadcast = async () => {
     if (!broadcastMsg.trim()) return;
-    const res = await apiFetch(`/api/servers/${slug}/proclamations`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: broadcastMsg }),
-    });
-    const data = await safeJson(res);
-    if (data.success) { setBroadcastMsg(""); showMsg("بیانیه صادر شد 📣", "success"); await fetchState(); }
-    else showMsg((data.error as string) || "خطا", "error");
+    if (isBusy) return;
+    setIsBusy(true);
+    try {
+      const res = await apiFetch(`/api/servers/${slug}/proclamations`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: broadcastMsg }),
+      });
+      const data = await safeJson(res);
+      if (data.success) { setBroadcastMsg(""); showMsg("بیانیه صادر شد 📣", "success"); await fetchState(); }
+      else showMsg((data.error as string) || "خطا", "error");
+    } finally {
+      setIsBusy(false);
+    }
   };
 
   // این محاسبات باید قبل از هر return شرطی انجام بشن تا استفاده‌شون در useEffect زیر
@@ -471,17 +540,24 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
           {myTribe && (
             <>
               <button
+                disabled={isBusy}
                 onClick={async () => {
-                  const res = await apiFetch(`/api/servers/${slug}/toggle-ai`, { method: "POST" });
-                  const d = await safeJson(res);
-                  if (d.success) {
-                    showMsg(d.aiEnabled ? "🤖 AI روشن شد - جای شما بازی می‌کنه" : "🎮 AI خاموش شد - دستی بازی می‌کنی", "info");
-                    await fetchState();
-                  } else {
-                    showMsg((d.error as string) || "خطا", "error");
+                  if (isBusy) return;
+                  setIsBusy(true);
+                  try {
+                    const res = await apiFetch(`/api/servers/${slug}/toggle-ai`, { method: "POST" });
+                    const d = await safeJson(res);
+                    if (d.success) {
+                      showMsg(d.aiEnabled ? "🤖 AI روشن شد - جای شما بازی می‌کنه" : "🎮 AI خاموش شد - دستی بازی می‌کنی", "info");
+                      await fetchState();
+                    } else {
+                      showMsg((d.error as string) || "خطا", "error");
+                    }
+                  } finally {
+                    setIsBusy(false);
                   }
                 }}
-                className={`text-xs px-3 py-1.5 rounded-lg ${
+                className={`text-xs px-3 py-1.5 rounded-lg disabled:opacity-50 ${
                   myTribe.aiEnabled === true
                     ? "bg-purple-600 hover:bg-purple-500 text-white"
                     : "bg-slate-700 hover:bg-slate-600 text-slate-200"
@@ -489,7 +565,7 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
               >
                 🤖 AI: {myTribe.aiEnabled ? "روشن" : "خاموش"}
               </button>
-              <button onClick={releaseTribe} className="bg-slate-700 hover:bg-slate-600 text-white text-xs px-3 py-1.5 rounded-lg">
+              <button onClick={releaseTribe} disabled={isBusy} className="bg-slate-700 hover:bg-slate-600 text-white text-xs px-3 py-1.5 rounded-lg disabled:opacity-50">
                 🚪 رها کردن قبیله
               </button>
             </>
@@ -780,7 +856,7 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
                         <div className="text-sm">👥 سرباز <span className="text-xs text-slate-400">({SOLDIER_PRICE}💎)</span></div>
                         <div className="flex gap-1">
                           {[1, 5, 10].map((q) => (
-                            <button key={q} disabled={myTribe.coins < SOLDIER_PRICE * q || myTribe.soldiers + q > MAX_SOLDIERS}
+                            <button key={q} disabled={isBusy || myTribe.coins < SOLDIER_PRICE * q || myTribe.soldiers + q > MAX_SOLDIERS}
                               onClick={() => buySoldier(q)}
                               className="bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 disabled:text-slate-500 text-white text-xs px-2 py-1 rounded">
                               +{q}
@@ -813,7 +889,7 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
                                   </div>
                                   <div className="text-right ml-2">
                                     <div className="text-amber-300 font-bold">{u.price}💎</div>
-                                    <button disabled={myTribe.coins < u.price}
+                                    <button disabled={isBusy || myTribe.coins < u.price}
                                       onClick={() => buyUnit(u.id, 1)}
                                       className="bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 disabled:text-slate-500 text-white text-[10px] px-2 py-1 rounded mt-1">
                                       خرید
@@ -854,14 +930,14 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
                             <div className="text-slate-400 text-[10px]">درآمد فعلی: {Math.floor(def.incomePerTick * f.level * f.health / 100)}/تیک</div>
                             <div className="flex gap-1">
                               {f.level < def.maxLevel && (
-                                <button disabled={myTribe.coins < upCost}
+                                <button disabled={isBusy || myTribe.coins < upCost}
                                   onClick={() => factoryAction("factory_upgrade", def.id)}
                                   className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 text-white text-[10px] py-1 rounded">
                                   ⬆ ارتقا ({upCost}💎)
                                 </button>
                               )}
                               {needRepair > 0 && (
-                                <button disabled={myTribe.coins < needRepair * REPAIR_COST_PER_PERCENT}
+                                <button disabled={isBusy || myTribe.coins < needRepair * REPAIR_COST_PER_PERCENT}
                                   onClick={() => factoryAction("factory_repair", def.id, needRepair)}
                                   className="flex-1 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 text-white text-[10px] py-1 rounded">
                                   🔧 بازسازی ({needRepair * REPAIR_COST_PER_PERCENT}💎)
@@ -879,7 +955,7 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
                               <div className="font-bold">{def.emoji} {def.name}</div>
                               <div className="text-slate-400 text-[10px]">{def.description} · +{def.incomePerTick}💎/تیک</div>
                             </div>
-                            <button disabled={myTribe.coins < def.price}
+                            <button disabled={isBusy || myTribe.coins < def.price}
                               onClick={() => factoryAction("factory_build", def.id)}
                               className="bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 text-white text-[10px] px-2 py-1 rounded">
                               {def.price}💎
@@ -956,7 +1032,7 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
                         )}
                       </div>
 
-                      <button onClick={attack} disabled={!target || projectedPower === 0}
+                      <button onClick={attack} disabled={isBusy || !target || projectedPower === 0}
                         className="w-full bg-red-600 hover:bg-red-500 disabled:bg-slate-700 disabled:text-slate-500 text-white font-bold py-2 rounded-lg">
                         ⚔️ شلیک!
                       </button>
@@ -974,8 +1050,8 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
                             <div key={r.id} className="flex justify-between items-center bg-slate-800/50 rounded p-2 text-sm">
                               <span>{r.fromTribeName}</span>
                               <div className="flex gap-1">
-                                <button onClick={() => respondToRequest(r.id, true)} className="text-xs bg-emerald-600 hover:bg-emerald-500 text-white px-2 py-1 rounded">قبول</button>
-                                <button onClick={() => respondToRequest(r.id, false)} className="text-xs bg-red-600 hover:bg-red-500 text-white px-2 py-1 rounded">رد</button>
+                                <button onClick={() => respondToRequest(r.id, true)} disabled={isBusy} className="text-xs bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white px-2 py-1 rounded">قبول</button>
+                                <button onClick={() => respondToRequest(r.id, false)} disabled={isBusy} className="text-xs bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white px-2 py-1 rounded">رد</button>
                               </div>
                             </div>
                           ))}
@@ -989,7 +1065,7 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
                           {outgoingRequests.map((r) => (
                             <div key={r.id} className="flex justify-between items-center bg-slate-800/50 rounded p-2 text-sm">
                               <span>{r.toTribeName}</span>
-                              <button onClick={() => cancelRequest(r.id)} className="text-xs bg-slate-600 hover:bg-slate-500 text-white px-2 py-1 rounded">لغو</button>
+                              <button onClick={() => cancelRequest(r.id)} disabled={isBusy} className="text-xs bg-slate-600 hover:bg-slate-500 disabled:opacity-50 text-white px-2 py-1 rounded">لغو</button>
                             </div>
                           ))}
                         </div>
@@ -1000,7 +1076,7 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
                       {myAllies.map((a) => (
                         <div key={a.id} className="flex justify-between items-center bg-slate-800/50 rounded p-2 text-sm">
                           <span>🤝 {a.name}</span>
-                          <button onClick={() => breakAlly(a.id)} className="text-xs bg-red-600 text-white px-2 py-1 rounded">شکستن</button>
+                          <button onClick={() => breakAlly(a.id)} disabled={isBusy} className="text-xs bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white px-2 py-1 rounded">شکستن</button>
                         </div>
                       ))}
                       <div className="text-xs text-slate-400 mt-3">قبایل برای اتحاد (فقط قبایلی که مالک دارند می‌توانند تأیید کنند):</div>
@@ -1015,7 +1091,7 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
                                 {alreadySent ? (
                                   <span className="text-xs text-slate-500">در انتظار پاسخ...</span>
                                 ) : (
-                                  <button onClick={() => propose(t.id)} className="text-xs bg-emerald-600 text-white px-2 py-1 rounded">درخواست اتحاد</button>
+                                  <button onClick={() => propose(t.id)} disabled={isBusy} className="text-xs bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white px-2 py-1 rounded">درخواست اتحاد</button>
                                 )}
                               </div>
                             );
@@ -1060,7 +1136,7 @@ export default function GamePlay({ user, slug }: { user: AuthUser; slug: string 
                         className="w-full bg-slate-800 border border-slate-600 rounded-lg p-2 text-sm resize-none" />
                       <div className="flex items-center justify-between">
                         <span className="text-xs text-slate-500">{broadcastMsg.length}/500</span>
-                        <button onClick={sendBroadcast} disabled={!broadcastMsg.trim()}
+                        <button onClick={sendBroadcast} disabled={isBusy || !broadcastMsg.trim()}
                           className="bg-amber-500 hover:bg-amber-400 disabled:bg-slate-700 text-slate-900 font-bold text-xs px-4 py-1.5 rounded-lg">
                           📢 صدور بیانیه
                         </button>

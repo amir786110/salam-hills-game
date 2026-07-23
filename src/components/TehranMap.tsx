@@ -34,6 +34,20 @@ interface Props {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type L = any;
 
+// رفع باگ امنیتی XSS: نام‌های قبیله و بازیکنان (که کاربر می‌تونه آزادانه تنظیم کنه)
+// مستقیماً داخل L.divIcon({ html: ... }) قرار می‌گرفتن بدون escape کردن.
+// اگه کاربری اسم نمایشی‌اش رو به چیزی مثل <img src=x onerror=alert(1)> تغییر
+// می‌داد، این کد در مرورگر تمام بازیکنانی که نقشه رو می‌دیدن اجرا می‌شد
+// (stored XSS). این تابع کاراکترهای خطرناک HTML رو escape می‌کنه.
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 export default function TehranMap({ tribes, selectedId, onSelect, alliances, myTribeId }: Props) {
   const mapRef = useRef<HTMLDivElement | null>(null);
   const mapInstance = useRef<L | null>(null);
@@ -125,7 +139,7 @@ export default function TehranMap({ tribes, selectedId, onSelect, alliances, myT
       // حالا حداقل یک مارکر نشون داده می‌شه.
       if (!poly || poly.length < 3) {
         const icon = L.divIcon({
-          html: `<div style="background:#000;color:#aaa;padding:2px 6px;border-radius:6px;font-size:11px;font-family:Tahoma,sans-serif;">💀 ${t.name}</div>`,
+          html: `<div style="background:#000;color:#aaa;padding:2px 6px;border-radius:6px;font-size:11px;font-family:Tahoma,sans-serif;">💀 ${escapeHtml(t.name)}</div>`,
           className: "tribe-label",
           iconSize: [120, 24],
           iconAnchor: [60, 12],
@@ -154,17 +168,18 @@ export default function TehranMap({ tribes, selectedId, onSelect, alliances, myT
       polygon.addTo(layerGroup.current);
       polygon.on("click", () => onSelectRef.current(t.id));
 
-      // برچسب
+      // برچسب (رفع باگ XSS: تمام مقادیر ورودی کاربر escape می‌شن)
       const ownerBadge = t.owner
-        ? `<span style="background:#0ea5e9;color:white;padding:1px 4px;border-radius:4px;font-size:9px;margin-left:3px;">${t.owner.avatar} ${t.owner.displayName}</span>`
+        ? `<span style="background:#0ea5e9;color:white;padding:1px 4px;border-radius:4px;font-size:9px;margin-left:3px;">${escapeHtml(t.owner.avatar)} ${escapeHtml(t.owner.displayName)}</span>`
         : `<span style="background:#10b981;color:white;padding:1px 5px;border-radius:4px;font-size:9px;margin-left:3px;font-weight:bold;">🆓 آزاد — کلیک کن!</span>`;
 
       const stats = `${t.territoryPct}٪ · 👥${t.soldiers} · ⚔${t.attackPower ?? 0} 🛡${t.defensePower ?? 0}`;
+      const safeName = escapeHtml(t.name);
       const label = t.isAlive
         ? `<div style="background:${t.color};padding:3px 6px;border-radius:6px;border:${
             isSelected ? "2px solid #fbbf24" : isMine ? "2px solid #22c55e" : "1px solid rgba(255,255,255,0.7)"
-          };color:white;font-size:11px;font-weight:bold;text-shadow:0 1px 2px rgba(0,0,0,0.9);white-space:nowrap;font-family:Tahoma,sans-serif;box-shadow:0 2px 4px rgba(0,0,0,0.5);">${t.name} ${ownerBadge}<br/><span style="font-size:9px;font-weight:normal;">${stats}</span></div>`
-        : `<div style="background:#000;color:#aaa;padding:2px 6px;border-radius:6px;font-size:11px;font-family:Tahoma,sans-serif;">💀 ${t.name}</div>`;
+          };color:white;font-size:11px;font-weight:bold;text-shadow:0 1px 2px rgba(0,0,0,0.9);white-space:nowrap;font-family:Tahoma,sans-serif;box-shadow:0 2px 4px rgba(0,0,0,0.5);">${safeName} ${ownerBadge}<br/><span style="font-size:9px;font-weight:normal;">${stats}</span></div>`
+        : `<div style="background:#000;color:#aaa;padding:2px 6px;border-radius:6px;font-size:11px;font-family:Tahoma,sans-serif;">💀 ${safeName}</div>`;
 
       const icon = L.divIcon({
         html: label,

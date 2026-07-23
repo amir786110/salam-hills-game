@@ -30,20 +30,8 @@ export const TRIBE_SEEDS: TribeSeed[] = [
   { name: "سلام ایران زمین",  district: "ایران زمین",    color: "#f43f5e", lat: 35.7620, lng: 51.3660, aiPersonality: "balanced" },
 ];
 
-export const PRICES = {
-  soldier: 10,
-  missile: 80,
-  defense: 60,
-  jet: 200,
-};
-
-export const POWER = {
-  soldier: 1,
-  missile: 15,
-  jet: 25,
-  defense: 12,
-};
-
+// توجه: قیمت‌ها و قدرت‌های واقعی تسلیحات در units-catalog.ts تعریف شده‌اند
+// (این بازی از یک سیستم چندمدلی برای هر نوع تسلیحات استفاده می‌کند).
 export const MAX_SOLDIERS = 100;
 
 // مرکز نقشه تهران
